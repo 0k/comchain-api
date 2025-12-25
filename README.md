@@ -67,6 +67,29 @@ People are the Priority: People are the most important.
 
 - If it can be hacked, it will be hacked: Never save, store, or transmit secret info, like passwords or keys. Open source & auditable.
 
+## Test
+
+Run tests in Docker (no local PHP needed):
+- `./bin/test` — defaults to PHP 8.3
+- `./bin/test -V 7.4` — choose a PHP version (matrix: >= 7, ie:
+  `7.0.33`, `7.4`, `8`)
+- `./bin/test -V 7.4,8.3` — run multiple versions in one call (comma-separated)
+- `./bin/test -V all` — run every known `php:<N.M>-cli-alpine` tag (discovered
+  from Docker Hub and cached in `.docker-cache/php-cli-tag-cache.txt`; cache
+  refreshes weekly)
+
+Coverage (HTML in `./.coverage-html`):
+- `./bin/test --coverage`
+- `./bin/test -V 7.0 --coverage` (works across the matrix)
+- After a coverage run, open `.coverage-html/index.html` (a clickable
+  link is printed)
+
+Notes
+- The runner builds a versioned image and caches by tag
+  (`comchain-phpunit:<version>`).
+- No repo phpunit.xml required; the script generates one per run.
+- Officially exercised versions: 7.0.33, 7.4.33, 8.3.29.
+
 ## Contact
 
 If you can think of any other features or run into bugs, let us know. You can drop a line at it {at} monnaie {-} leman dot org.

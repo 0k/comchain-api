@@ -95,6 +95,7 @@ function get_transactions($session, $addr, $limit, $offset) {
     return $output;
 }
 
+// @codeCoverageIgnoreStart
 // Main entry point - only runs when executed directly
 if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
     header('Access-Control-Allow-Origin: *');
@@ -116,4 +117,5 @@ if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
 
     echo json_encode(get_transactions($session, $addr, $limit, $offset));
 }
+// @codeCoverageIgnoreEnd
 ?>
