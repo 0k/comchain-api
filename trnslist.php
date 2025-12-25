@@ -33,6 +33,7 @@ function get_transactions($session, $addr, $limit, $offset) {
     });
 
     $seen = [];
+    $seen_idx = [];
     $txs = [];
     $txs_count = 0;
 
@@ -60,10 +61,27 @@ function get_transactions($session, $addr, $limit, $offset) {
 
         // Deduplicate by hash
         $hash = $row['hash'];
-        if (isset($seen[$hash]) && $seen[$hash] <= $row['status']) {
+        if (isset($seen[$hash])) {
+            // Status 0 is final.
+            if ($seen[$hash] == 0) {
+                continue;
+            }
+            // Replace previously stored row with the lower-status one
+            if (isset($seen_idx[$hash])) {
+                $txs[$seen_idx[$hash]] = $row;
+            }
+            $seen[$hash] = $row['status'];
+            // Once we keep a status 0 version, we no longer need an index tracked.
+            if ($row['status'] == 0) {
+                unset($seen_idx[$hash]);
+            }
             continue;
         }
         $seen[$hash] = $row['status'];
+        // Only track index when status > 0; status 0 is final and won't be replaced.
+        if ($row['status'] > 0) {
+            $seen_idx[$hash] = $txs_count;
+        }
 
         $txs[] = $row;
         if (++$txs_count >= $needed) break;

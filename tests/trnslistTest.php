@@ -42,6 +42,24 @@ class TrnslistTest extends TestCase
         $this->assertSame('0xpending1', $tx['hash']);
     }
 
+    public function testDuplicateHashWithDifferentStatusShouldDedup()
+    {
+        // Status=1 (pending) arrives first, followed by status=0 (confirmed) of same hash.
+        $session = session([
+            'status = 1' => page([
+                tx('0xdup', 1000, 1),
+            ]),
+            'status = 0' => page([
+                tx('0xdup', 900, 0),
+            ]),
+        ]);
+
+        $result = get_transactions($session, '0xaddr1', 10, 0);
+
+        // Expected behavior: only one tx per hash.
+        $this->assertCount(1, $result, 'Should not emit the same hash twice even if statuses differ');
+    }
+
     public function testPaginationOffsetAndLimit()
     {
         // Four transactions, request 2 with offset 1 -> expect hash2, hash3
