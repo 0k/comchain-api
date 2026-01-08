@@ -13,17 +13,32 @@ VERSIONS=()
 PHPUNIT_ARGS=()
 COVERAGE_REPORTS=()
 ALL_VERSIONS=()
+DEBUG="${DEBUG:-}"
+
+WHITE=$'\e[37;1m'
+RED=$'\e[31m'
+GREEN=$'\e[32;1m'
+RESET=$'\e[0m'
 
 add_version() {
     local version="$1"
+
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        echo "Warning: ignoring invalid PHP version specified: '$version'" >&2
+        return 1
+    fi
+
     local existing=""
     for existing in "${VERSIONS[@]}"; do
         if [ "$existing" = "$version" ]; then
-            return
+            return 1
         fi
     done
     VERSIONS+=("$version")
 }
+
+version:gt() { [ "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1" ]; }
+version:le() { ! version:gt "$@"; }
 
 # Avoid writing Docker metadata (buildx activity store) into $HOME when it may
 # be read-only inside the sandbox; default to a writable repo-local directory.
@@ -35,6 +50,7 @@ mkdir -p "${DOCKER_CONFIG}"
 TAG_CACHE_FILE="${DOCKER_CONFIG}/php-cli-tag-cache.txt"
 # Refresh cache every 7 days unless overridden via PHP_TAG_CACHE_MAX_AGE_SECONDS
 TAG_CACHE_MAX_AGE_SECONDS="${PHP_TAG_CACHE_MAX_AGE_SECONDS:-604800}"
+DIGEST_CACHE_DIR="${DOCKER_CONFIG}/php-cli-digest-cache"
 
 refresh_php_tag_cache() {
     # Requires curl and python3; silently fall back to defaults if unavailable.
@@ -114,10 +130,10 @@ while [ $# -gt 0 ]; do
                         load_all_versions || exit 1
 
                         for all_version in "${ALL_VERSIONS[@]}"; do
-                            add_version "$all_version"
+                            add_version "$all_version" || exit 1
                         done
                     else
-                        add_version "$version"
+                        add_version "$version" || exit 1
                     fi
                 fi
             done
@@ -159,13 +175,14 @@ run_for_version() {
         base_tag="php:${php_version}-cli-alpine"
     fi
     if ! docker image inspect "$base_tag" >/dev/null 2>&1; then
-        echo "Pulling Docker image ${base_tag}..." >&2
+        echo "Pulling docker image ${base_tag} as base PHP image..." >&2
         if ! docker pull "$base_tag" >/dev/null 2>&1; then
             echo "Error: unable to pull Docker image $base_tag. Please use an existing php:<version>-cli-alpine tag (e.g., 7.4, 8.3, 8, 8.5)." >&2
             return 1
         fi
+        echo "  ... pulled." >&2
     else
-        echo "Using cached Docker image ${base_tag}" >&2
+        [ -n "$DEBUG" ] && echo "Using cached docker image ${base_tag} as base PHP image" >&2
     fi
 
     # Discover the actual PHP version inside the base image
@@ -175,6 +192,19 @@ run_for_version() {
         return 1
     fi
     base_tag="php:${FULL_VERSION}-cli-alpine"
+
+    ## to avoid buildx querying registry
+    mkdir -p "${DIGEST_CACHE_DIR}"
+    if [ -f "${DIGEST_CACHE_DIR}/$base_tag" ]; then
+        base_image_by_digest="$(cat "${DIGEST_CACHE_DIR}/$base_tag")"
+    else
+        if ! inspect_base_image=$(docker buildx imagetools inspect "$base_tag"); then
+            echo "Could not inspect base image '$base_tag'" >&2
+            return 1
+        fi
+        base_image_by_digest=php@$(printf "%s" "$inspect_base_image" | grep 'Digest:' | head -n1 | awk '{print $2}')
+        echo "$base_image_by_digest" > "${DIGEST_CACHE_DIR}/$base_tag"
+    fi
 
     major="${FULL_VERSION%%.*}"
     minor_part="${FULL_VERSION#*.}"
@@ -252,8 +282,9 @@ run_for_version() {
     fi
 
     IMAGE="comchain-phpunit:${FULL_VERSION}"
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 
-    DOCKERFILE_CONTENT=$(cat <<'EOF'
+        DOCKERFILE_CONTENT=$(cat <<'EOF'
 ARG BASE_TAG=php:cli-alpine
 FROM ${BASE_TAG}
 
@@ -287,17 +318,23 @@ RUN set -e; \
 WORKDIR /app
 CMD ["phpunit"]
 EOF
-                      )
+                          )
 
-    echo "Building image ${IMAGE} (PHP ${php_version})..."
-    echo "${DOCKERFILE_CONTENT}" | docker build \
-                                          --build-arg BASE_TAG="${base_tag}" \
-                                          --build-arg PHPUNIT_URL="${PHPUNIT_URL}" \
-                                          --build-arg COVERAGE_DRIVER="${COVERAGE_DRIVER}" \
-                                          --build-arg PCOV_VERSION="${PCOV_VERSION}" \
-                                          --build-arg XDEBUG_VERSION="${XDEBUG_VERSION}" \
-                                          -t "${IMAGE}" -f - .
-
+        echo "Building image ${IMAGE} (PHP ${php_version})..." >&2
+        if ! out=$(echo "${DOCKERFILE_CONTENT}" | docker build \
+                                                         --build-arg BASE_TAG="${base_image_by_digest}" \
+                                                         --build-arg PHPUNIT_URL="${PHPUNIT_URL}" \
+                                                         --build-arg COVERAGE_DRIVER="${COVERAGE_DRIVER}" \
+                                                         --build-arg PCOV_VERSION="${PCOV_VERSION}" \
+                                                         --build-arg XDEBUG_VERSION="${XDEBUG_VERSION}" \
+                                                         -t "${IMAGE}" -f - . ); then
+            echo "Error: unable to build Docker image ${IMAGE}" >&2
+            return 1
+        fi
+        echo "  Built image: ${out}" >&2
+    else
+        [ -n "$DEBUG" ] && echo "Using cached image ${IMAGE}" >&2
+    fi
     # Generate phpunit configuration tailored to version (written to a temp file)
     tmp_cfg="$(mktemp /tmp/phpunit.XXXXXX.xml)"
 
@@ -336,7 +373,7 @@ ${COVERAGE_XML}
 </phpunit>
 CFG
 
-    echo "Running phpunit in ${IMAGE}..."
+    [ -n "$DEBUG" ] && echo "Running phpunit in ${IMAGE}..." >&2
     PHPUNIT_OPTS=()
     if $COVERAGE; then
         COVERAGE_DIR="$(pwd)/.coverage-html/${FULL_VERSION}"
@@ -364,21 +401,38 @@ CFG
         MEMORY_LIMIT="1G"
     fi
 
+    docker_run_opts=(
+        --rm
+        --user "${DOCKER_USER}"
+        -v "$PWD":/app
+        -v "$tmp_cfg":/tmp/phpunit.xml
+        "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}"
+    )
+
+    php_run_opts=(
+        -d memory_limit="${MEMORY_LIMIT}"
+    )
     if [ "$major" -ge 8 ]; then
-        # Suppress return-type deprecations from legacy mocks on PHP 8+
-        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" php -d error_reporting=8191 -d memory_limit="${MEMORY_LIMIT}" /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
-            run_status=$?
-        fi
-    else
-        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" php -d memory_limit="${MEMORY_LIMIT}" /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
-            run_status=$?
-        fi
+        php_run_opts+=(-d error_reporting=8191)
     fi
+
+    docker_run_cmd=(
+        docker run "${docker_run_opts[@]}"
+        php "${php_run_opts[@]}"
+        /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"
+    )
+
+    [ -n "$DEBUG" ] && echo "Running command: ${docker_run_cmd[*]}" >&2
+
+    "${docker_run_cmd[@]}"
+    run_status=$?
 
     rm -f "$tmp_cfg"
     if [ "$run_status" -ne 0 ]; then
+        echo "Tests ${RED}failed${RESET} for PHP ${FULL_VERSION}" >&2
         return "$run_status"
     fi
+    echo "Tests ${GREEN}passed${RESET} for PHP ${FULL_VERSION}" >&2
 
     if $COVERAGE; then
         LINK="file://${COVERAGE_DIR}/index.html"
@@ -388,7 +442,8 @@ CFG
 
 print_coverage_reports() {
     if $COVERAGE && [ "${#COVERAGE_REPORTS[@]}" -gt 0 ]; then
-        echo "HTML Coverage reports:"
+        echo
+        echo "${WHITE}HTML Coverage reports${RESET}:"
         for report in "${COVERAGE_REPORTS[@]}"; do
             version="${report%%|*}"
             link="${report#*|}"

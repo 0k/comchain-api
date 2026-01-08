@@ -2,3 +2,5 @@ ipns
 vendor
 Cassandra transaction table.cql
 composer.json
+.docker-cache
+.coverage-html
