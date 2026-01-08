@@ -337,9 +337,10 @@ function storeTransaction($is_valid_shop, $transaction_ash, $web_hook_status, $a
     $val[]='?';
     */
 
+    $now = time();
     // build the query
     $query = "INSERT INTO testtransactions (".join(', ',array_keys($fields));
-    $query = $query.',time,receivedAt) VALUES ('.join(', ',$val).','.time().','.time().')';
+    $query = $query.',time,receivedAt) VALUES ('.join(', ',$val).','.$now.','.$now.')';
     
     $keyspace  = 'comchain';
     // for pledge only the other direction is inserted
