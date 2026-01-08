@@ -185,46 +185,69 @@ run_for_version() {
     PHPUNIT_MAJOR=12
 
     if [ "$major" -eq 7 ] && [ "$minor" -eq 0 ]; then
-        # PHP 7.0
+        # PHP 7.0 - no branch coverage (xdebug 2.x)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-6.5.14.phar"
         COVERAGE_DRIVER="xdebug"
         XDEBUG_VERSION="2.6.1"
         PHPUNIT_MAJOR=6
-    elif [ "$major" -eq 7 ] && [ "$minor" -le 2 ]; then
-        # PHP 7.1–7.2
+    elif [ "$major" -eq 7 ] && [ "$minor" -eq 1 ]; then
+        # PHP 7.1 - no branch coverage (xdebug 2.x)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-7.5.20.phar"
         COVERAGE_DRIVER="xdebug"
         XDEBUG_VERSION="2.6.1"
         PHPUNIT_MAJOR=7
+    elif [ "$major" -eq 7 ] && [ "$minor" -eq 2 ]; then
+        # PHP 7.2 - no branch coverage (phpunit < 9.3)
+        #  cf: https://github.com/sebastianbergmann/phpunit/issues/4260
+        # phpunit 9.3 requires php 7.3+
+        #  cf: https://phpunit.de/announcements/phpunit-9.html
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-8.5.38.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.0.4"
+        PHPUNIT_MAJOR=8
     elif [ "$major" -eq 7 ]; then
-        # PHP 7.3–7.4
+        # PHP 7.3–7.4 - branch coverage supported (xdebug 3.1.x)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-9.6.19.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.1.6"
         PHPUNIT_MAJOR=9
     elif [ "$major" -eq 8 ] && [ "$minor" -eq 0 ]; then
-        # PHP 8.0
+        # PHP 8.0 - branch coverage supported (xdebug 3.2.x)
+        # Note: xdebug 3.1.x has a path coverage segfault bug, fixed in 3.2.x
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-9.6.19.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
         PHPUNIT_MAJOR=9
     elif [ "$major" -eq 8 ] && [ "$minor" -eq 1 ]; then
-        # PHP 8.1
+        # PHP 8.1 - branch coverage supported (xdebug 3.2.x)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-10.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
         PHPUNIT_MAJOR=10
     elif [ "$major" -eq 8 ] && [ "$minor" -eq 2 ]; then
-        # PHP 8.2
+        # PHP 8.2 - branch coverage supported (xdebug 3.2.x)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-11.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
         PHPUNIT_MAJOR=11
-    elif [ "$major" -eq 8 ]; then
-        # PHP 8.3+ (default to pcov; fall back to xdebug if build fails)
+    elif [ "$major" -eq 8 ] && [ "$minor" -le 4 ]; then
+        # PHP 8.3-8.4 - branch coverage supported (xdebug 3.4.x)
+        # Note: xdebug 3.3.x has compilation errors with PHP 8.3.29+
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.4.0"
+        PHPUNIT_MAJOR=12
+    elif [ "$major" -eq 8 ]; then
+        # PHP 8.5+ - branch coverage supported (xdebug 3.5.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.5.0"
         PHPUNIT_MAJOR=12
     else
-        # PHP 9+ (assume latest PHPUnit supports)
+        # PHP 9+ (assume latest PHPUnit and xdebug)
         PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
-        COVERAGE_DRIVER="pcov"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION=""
         PHPUNIT_MAJOR=12
     fi
 
@@ -250,12 +273,12 @@ RUN set -e; \
             echo "pcov install failed, falling back to xdebug" >&2; \
             if [ -n "${XDEBUG_VERSION}" ]; then pecl install xdebug-${XDEBUG_VERSION}; else pecl install xdebug; fi; \
             docker-php-ext-enable xdebug; \
-            { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=0"; } > /usr/local/etc/php/conf.d/coverage.ini; \
+            { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=no"; } > /usr/local/etc/php/conf.d/coverage.ini; \
         fi; \
     else \
         if [ -n "${XDEBUG_VERSION}" ]; then pecl install xdebug-${XDEBUG_VERSION}; else pecl install xdebug; fi; \
         docker-php-ext-enable xdebug; \
-        { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=0"; } > /usr/local/etc/php/conf.d/coverage.ini; \
+        { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=no"; } > /usr/local/etc/php/conf.d/coverage.ini; \
     fi; \
     apk del $PHPIZE_DEPS; \
     curl -Ls ${PHPUNIT_URL} -o /usr/local/bin/phpunit; \
@@ -320,10 +343,13 @@ CFG
         rm -rf "${COVERAGE_DIR}"
         mkdir -p "${COVERAGE_DIR}"
         chmod 777 "${COVERAGE_DIR}"
-        if [ "${PHPUNIT_MAJOR}" -lt 10 ]; then
-            PHPUNIT_OPTS+=(--coverage-html "${COVERAGE_DIR}" --coverage-text)
-        else
-            PHPUNIT_OPTS+=(--coverage-html "${COVERAGE_DIR}" --coverage-filter /app/trnslist.php --coverage-text)
+        PHPUNIT_OPTS+=(--coverage-html "${COVERAGE_DIR}" --coverage-text)
+        # Branch coverage requires Xdebug 3.0+ and PHPUnit 9.3+
+        if [ "${PHPUNIT_MAJOR}" -ge 9 ] && [ "${COVERAGE_DRIVER}" = "xdebug" ]; then
+            PHPUNIT_OPTS+=(--path-coverage)
+        fi
+        if [ "${PHPUNIT_MAJOR}" -ge 10 ]; then
+            PHPUNIT_OPTS+=(--coverage-filter /app/trnslist.php)
         fi
     fi
 
@@ -332,13 +358,19 @@ CFG
         DOCKER_COVERAGE_MOUNT=(-v "${COVERAGE_DIR}:${COVERAGE_DIR}")
     fi
 
+    # Memory limit for coverage (path coverage is memory intensive)
+    MEMORY_LIMIT="512M"
+    if $COVERAGE; then
+        MEMORY_LIMIT="1G"
+    fi
+
     if [ "$major" -ge 8 ]; then
         # Suppress return-type deprecations from legacy mocks on PHP 8+
-        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" php -d error_reporting=8191 /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
+        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" php -d error_reporting=8191 -d memory_limit="${MEMORY_LIMIT}" /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
             run_status=$?
         fi
     else
-        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
+        if ! docker run --rm --user "${DOCKER_USER}" -v "$PWD":/app -v "$tmp_cfg":/tmp/phpunit.xml "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}" php -d memory_limit="${MEMORY_LIMIT}" /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"; then
             run_status=$?
         fi
     fi
