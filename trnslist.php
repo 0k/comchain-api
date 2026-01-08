@@ -4,8 +4,8 @@ require_once __DIR__ . '/includes/cassandra.inc';
 
 function get_transactions($session, $addr, $limit, $offset) {
     $needed = $offset + $limit;
-    $page_size = 50;
-    $pending_cutoff = time() - 3600;
+    $page_size = TXS_CASSANDRA_QUERY_PAGE_SIZE;
+    $pending_cutoff = time() - TXS_PENDING_CUTOFF_AGE;
 
     $iters = [
         paged_rows($session->execute(
@@ -107,6 +107,16 @@ function get_transactions($session, $addr, $limit, $offset) {
 // @codeCoverageIgnoreStart
 // Main entry point - only runs when executed directly
 if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
+    /**
+     * Page size for Cassandra queries.
+     */
+    define('TXS_CASSANDRA_QUERY_PAGE_SIZE', 50);
+
+    /**
+     * Maximum age in seconds for pending transactions to be included.
+     */
+    define('TXS_PENDING_CUTOFF_AGE', 3600);
+
     header('Access-Control-Allow-Origin: *');
 
     // Validate and parse input
