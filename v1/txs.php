@@ -11,9 +11,20 @@
  *        - With cursor, positive: get n transactions AFTER cursor (older)
  *   - cursor_time: (optional) timestamp of cursor transaction
  *   - cursor_hash: (optional) hash of cursor transaction
+ *
+ * Feature negotiation:
+ *   - Requires X-Client-Features header with txs/1
+ *   - Returns X-Selected-Features header with selected feature
+ *   - Returns 406 if no common feature found
  */
 
 require_once __DIR__ . '/../includes/cassandra.inc';
+require_once __DIR__ . '/../includes/features.inc';
+
+/**
+ * Supported features for this endpoint (no legacy support)
+ */
+define('TXS_SUPPORTED_FEATURES', ['txs/1']);
 
 /**
  * Validate and parse GET parameters for the txs endpoint
@@ -323,6 +334,12 @@ if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
 
     header('Access-Control-Allow-Origin: *');
     header('Content-Type: application/json');
+
+    // Feature negotiation (required - no legacy support)
+    $common_features = negotiate_features(TXS_SUPPORTED_FEATURES);
+    if ($common_features === null) {
+        exit;
+    }
 
     $result = txs_entrypoint($_GET);
 
