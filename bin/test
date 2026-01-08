@@ -365,8 +365,8 @@ EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <phpunit colors="true" bootstrap="/app/tests/bootstrap.php">
   <testsuites>
-    <testsuite name="trnslist">
-      <file>/app/tests/trnslistTest.php</file>
+    <testsuite name="all">
+      <directory suffix="Test.php">/app/tests</directory>
     </testsuite>
   </testsuites>
 ${COVERAGE_XML}

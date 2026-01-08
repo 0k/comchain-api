@@ -60,14 +60,63 @@ function page(array $rows, $next = null): \Iterator {
     };
 }
 
-function session(array $queryMap) {
-    return new class($queryMap) {
+/**
+ * Create a mock session
+ *
+ * @param array $queryMap Map of query patterns to pages
+ * @param array $cursors Optional list of valid cursors as [[time, hash], ...]
+ */
+function session(array $queryMap, array $cursors = null) {
+    // If cursors not explicitly provided, extract from queryMap pages
+    if ($cursors === null) {
+        $cursors = [];
+        foreach ($queryMap as $page) {
+            if ($page instanceof \Iterator) {
+                // Clone and iterate to extract cursors
+                $page->rewind();
+                while ($page->valid()) {
+                    $row = $page->current();
+                    $time = $row['time'] instanceof MockCassandraValue ? $row['time']->value() : $row['time'];
+                    $cursors[] = [$time, $row['hash']];
+                    $page->next();
+                }
+                $page->rewind();
+            }
+        }
+    }
+
+    return new class($queryMap, $cursors) {
         private $map;
-        public function __construct(array $map) { $this->map = $map; }
+        private $cursors;
+        public function __construct(array $map, array $cursors) {
+            $this->map = $map;
+            $this->cursors = $cursors;
+        }
         public function execute($statement, $options) {
             $query = (string)$statement;
+
+            // Handle cursor validation queries
+            if (strpos($query, 'time = ?') !== false && strpos($query, 'hash = ?') !== false) {
+                $args = $options['arguments'] ?? [];
+                if (count($args) >= 3) {
+                    $time = $args[1];
+                    $hash = $args[2];
+                    foreach ($this->cursors as $cursor) {
+                        if ($cursor[0] === $time && $cursor[1] === $hash) {
+                            return page([['hash' => $hash]]);
+                        }
+                    }
+                }
+                return page([]);
+            }
+
+            // Handle regular queries
             foreach ($this->map as $needle => $page) {
                 if (strpos($query, $needle) !== false) {
+                    // Reset iterator for reuse
+                    if ($page instanceof \Iterator) {
+                        $page->rewind();
+                    }
                     return $page;
                 }
             }

@@ -1,15 +1,6 @@
 <?php
 
-// Generator that yields rows across pages
-function paged_rows($page) {
-    while (true) {
-        foreach ($page as $row) {
-            yield $row;
-        }
-        if ($page->isLastPage()) break;
-        $page = $page->nextPage();
-    }
-}
+require_once __DIR__ . '/includes/cassandra.inc';
 
 function get_transactions($session, $addr, $limit, $offset) {
     $needed = $offset + $limit;
