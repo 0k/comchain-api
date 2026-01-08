@@ -27,9 +27,18 @@ function get_transactions($session, $addr, $limit, $offset) {
     $seen_idx = [];
     $txs = [];
     $txs_count = 0;
+    $enough_but_remaining_seen = false;
 
     // Merge all streams by time DESC, deduplicating
     while ($iters) {
+        // Check if we have enough but still have pending transactions to close
+        if ($txs_count >= $needed) {
+            if (empty($seen_idx)) {
+                break;
+            }
+            $enough_but_remaining_seen = true;
+        }
+
         // Find iterator with highest time (most recent), hash as tiebreaker
         $best_key = null;
         $best_rank = null;
@@ -50,6 +59,22 @@ function get_transactions($session, $addr, $limit, $offset) {
             unset($iters[$best_key]);
         }
 
+        if ($enough_but_remaining_seen) {
+            // Allow to look for more transactions in the past to
+            // close possible pending transactions
+            $last_time = $row['time']->value();
+            $found = false;
+            foreach ($seen_idx as $h => $sidx) {
+                if ($txs[$sidx]['time']->value() - $last_time < TXS_PENDING_CLOSURE_PAST_LOOKUP_LIMIT) {
+                    $found = true;
+                    break;
+                }
+                unset($seen_idx[$h]);   // too old
+            }
+            if (!$found) break;
+            $enough_but_remaining_seen = false;
+        }
+
         // Deduplicate by hash
         $hash = $row['hash'];
         if (isset($seen[$hash])) {
@@ -60,14 +85,22 @@ function get_transactions($session, $addr, $limit, $offset) {
             // Replace previously stored row with the lower-status one
             if (isset($seen_idx[$hash])) {
                 $txs[$seen_idx[$hash]] = $row;
+                // Once we keep a status 0 version, we no longer need an index tracked.
+                if ($row['status'] == 0) {
+                    unset($seen_idx[$hash]);
+                }
             }
+
+            if ($txs_count >= $needed)
+                continue;
+
             $seen[$hash] = $row['status'];
-            // Once we keep a status 0 version, we no longer need an index tracked.
-            if ($row['status'] == 0) {
-                unset($seen_idx[$hash]);
-            }
             continue;
         }
+
+        if ($txs_count >= $needed)
+            continue;
+
         $seen[$hash] = $row['status'];
         // Only track index when status > 0; status 0 is final and won't be replaced.
         if ($row['status'] > 0) {
@@ -75,7 +108,7 @@ function get_transactions($session, $addr, $limit, $offset) {
         }
 
         $txs[] = $row;
-        if (++$txs_count >= $needed) break;
+        $txs_count++;
     }
 
     // Apply pagination
@@ -116,6 +149,11 @@ if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
      * Maximum age in seconds for pending transactions to be included.
      */
     define('TXS_PENDING_CUTOFF_AGE', 3600);
+
+    /**
+     * How far back in time (seconds) to look for confirmed versions of pending transactions.
+     */
+    define('TXS_PENDING_CLOSURE_PAST_LOOKUP_LIMIT', 24 * 3600);
 
     header('Access-Control-Allow-Origin: *');
 
