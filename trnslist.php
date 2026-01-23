@@ -1,20 +1,11 @@
 <?php
 
-// Generator that yields rows across pages
-function paged_rows($page) {
-    while (true) {
-        foreach ($page as $row) {
-            yield $row;
-        }
-        if ($page->isLastPage()) break;
-        $page = $page->nextPage();
-    }
-}
+require_once __DIR__ . '/includes/cassandra.inc';
 
 function get_transactions($session, $addr, $limit, $offset) {
     $needed = $offset + $limit;
-    $page_size = 50;
-    $pending_cutoff = time() - 3600;
+    $page_size = TXS_CASSANDRA_QUERY_PAGE_SIZE;
+    $pending_cutoff = time() - TXS_PENDING_CUTOFF_AGE;
 
     $iters = [
         paged_rows($session->execute(
@@ -33,11 +24,21 @@ function get_transactions($session, $addr, $limit, $offset) {
     });
 
     $seen = [];
+    $seen_idx = [];
     $txs = [];
     $txs_count = 0;
+    $enough_but_remaining_seen = false;
 
     // Merge all streams by time DESC, deduplicating
     while ($iters) {
+        // Check if we have enough but still have pending transactions to close
+        if ($txs_count >= $needed) {
+            if (empty($seen_idx)) {
+                break;
+            }
+            $enough_but_remaining_seen = true;
+        }
+
         // Find iterator with highest time (most recent), hash as tiebreaker
         $best_key = null;
         $best_rank = null;
@@ -58,15 +59,56 @@ function get_transactions($session, $addr, $limit, $offset) {
             unset($iters[$best_key]);
         }
 
+        if ($enough_but_remaining_seen) {
+            // Allow to look for more transactions in the past to
+            // close possible pending transactions
+            $last_time = $row['time']->value();
+            $found = false;
+            foreach ($seen_idx as $h => $sidx) {
+                if ($txs[$sidx]['time']->value() - $last_time < TXS_PENDING_CLOSURE_PAST_LOOKUP_LIMIT) {
+                    $found = true;
+                    break;
+                }
+                unset($seen_idx[$h]);   // too old
+            }
+            if (!$found) break;
+            $enough_but_remaining_seen = false;
+        }
+
         // Deduplicate by hash
         $hash = $row['hash'];
-        if (isset($seen[$hash]) && $seen[$hash] <= $row['status']) {
+        if (isset($seen[$hash])) {
+            // Status 0 is final.
+            if ($seen[$hash] == 0) {
+                continue;
+            }
+            // Replace previously stored row with the lower-status one
+            if (isset($seen_idx[$hash])) {
+                $txs[$seen_idx[$hash]] = $row;
+                // Once we keep a status 0 version, we no longer need an index tracked.
+                if ($row['status'] == 0) {
+                    unset($seen_idx[$hash]);
+                }
+            }
+
+            if ($txs_count >= $needed)
+                continue;
+
+            $seen[$hash] = $row['status'];
             continue;
         }
+
+        if ($txs_count >= $needed)
+            continue;
+
         $seen[$hash] = $row['status'];
+        // Only track index when status > 0; status 0 is final and won't be replaced.
+        if ($row['status'] > 0) {
+            $seen_idx[$hash] = $txs_count;
+        }
 
         $txs[] = $row;
-        if (++$txs_count >= $needed) break;
+        $txs_count++;
     }
 
     // Apply pagination
@@ -95,8 +137,24 @@ function get_transactions($session, $addr, $limit, $offset) {
     return $output;
 }
 
+// @codeCoverageIgnoreStart
 // Main entry point - only runs when executed directly
 if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
+    /**
+     * Page size for Cassandra queries.
+     */
+    define('TXS_CASSANDRA_QUERY_PAGE_SIZE', 50);
+
+    /**
+     * Maximum age in seconds for pending transactions to be included.
+     */
+    define('TXS_PENDING_CUTOFF_AGE', 3600);
+
+    /**
+     * How far back in time (seconds) to look for confirmed versions of pending transactions.
+     */
+    define('TXS_PENDING_CLOSURE_PAST_LOOKUP_LIMIT', 24 * 3600);
+
     header('Access-Control-Allow-Origin: *');
 
     // Validate and parse input
@@ -116,4 +174,5 @@ if (realpath($_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)) {
 
     echo json_encode(get_transactions($session, $addr, $limit, $offset));
 }
+// @codeCoverageIgnoreEnd
 ?>

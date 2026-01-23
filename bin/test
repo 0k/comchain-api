@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# Build and run tests inside Docker without installing PHP locally.
+# Usage: bin/test [-V PHP_VERSION] [--coverage] [-- <phpunit args>]
+# Example: bin/test -V 8.2 --coverage -- --testsuite trnslist
+
+set -euo pipefail
+
+COVERAGE=false
+DOCKER_USER="$(id -u):$(id -g)"
+
+PCOV_VERSION="1.0.12"
+VERSIONS=()
+PHPUNIT_ARGS=()
+COVERAGE_REPORTS=()
+ALL_VERSIONS=()
+DEBUG="${DEBUG:-}"
+
+WHITE=$'\e[37;1m'
+RED=$'\e[31m'
+GREEN=$'\e[32;1m'
+RESET=$'\e[0m'
+
+add_version() {
+    local version="$1"
+
+    if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        echo "Warning: ignoring invalid PHP version specified: '$version'" >&2
+        return 1
+    fi
+
+    local existing=""
+    for existing in "${VERSIONS[@]}"; do
+        if [ "$existing" = "$version" ]; then
+            return 1
+        fi
+    done
+    VERSIONS+=("$version")
+}
+
+version:gt() { [ "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1" ]; }
+version:le() { ! version:gt "$@"; }
+
+# Avoid writing Docker metadata (buildx activity store) into $HOME when it may
+# be read-only inside the sandbox; default to a writable repo-local directory.
+if [ -z "${DOCKER_CONFIG:-}" ]; then
+    export DOCKER_CONFIG="$PWD/.docker-cache"
+fi
+mkdir -p "${DOCKER_CONFIG}"
+
+TAG_CACHE_FILE="${DOCKER_CONFIG}/php-cli-tag-cache.txt"
+# Refresh cache every 7 days unless overridden via PHP_TAG_CACHE_MAX_AGE_SECONDS
+TAG_CACHE_MAX_AGE_SECONDS="${PHP_TAG_CACHE_MAX_AGE_SECONDS:-604800}"
+DIGEST_CACHE_DIR="${DOCKER_CONFIG}/php-cli-digest-cache"
+
+refresh_php_tag_cache() {
+    # Requires curl and python3; silently fall back to defaults if unavailable.
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        return 1
+    fi
+
+
+    local tmp_cache="${TAG_CACHE_FILE}.tmp"
+    echo "Fetching all latest valid tags..." >&2
+    if ! python3 - <<'PY' > "${tmp_cache}"; then
+import json, re, sys, urllib.request
+
+url = "https://hub.docker.com/v2/repositories/library/php/tags?page_size=100&name=cli-alpine"
+pattern = re.compile(r"^\d+\.\d+-cli-alpine$")
+seen = set()
+
+def version_key(tag: str):
+    base = tag.split("-")[0]
+    return [int(p) for p in base.split(".")]
+
+while url:
+    sys.stderr.write(f"  Fetching URL: {url}\n")
+    with urllib.request.urlopen(url) as resp:
+        data = json.load(resp)
+    for result in data.get("results", []):
+        name = result.get("name") or ""
+        if pattern.match(name):
+            version = name.split("-")[0]
+            if int(version.split(".")[0]) >= 7:
+                seen.add(version)  # keep "N.M"
+                sys.stderr.write(f"    Found version: {version}\n")
+    url = data.get("next")
+
+for tag in sorted(seen, key=version_key):
+    print(tag)
+PY
+                                                return 1
+    fi
+    echo "  ... fetched $(wc -l < "${tmp_cache}") tags." >&2
+    mv "${tmp_cache}" "${TAG_CACHE_FILE}"
+}
+
+load_all_versions() {
+    local now cache_mtime cache_age
+
+    if [ -f "${TAG_CACHE_FILE}" ]; then
+        cache_mtime=$(stat -c %Y "${TAG_CACHE_FILE}" 2>/dev/null || stat -f %m "${TAG_CACHE_FILE}" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        cache_age=$((now - cache_mtime))
+    else
+        cache_age=$((TAG_CACHE_MAX_AGE_SECONDS + 1))
+    fi
+
+    if [ ! -f "${TAG_CACHE_FILE}" ] || [ "${cache_age}" -ge "${TAG_CACHE_MAX_AGE_SECONDS}" ]; then
+        if ! refresh_php_tag_cache; then
+            echo "Error: unable to retrieve PHP tags." >&2
+            return 1
+        fi
+    fi
+
+    if [ -f "${TAG_CACHE_FILE}" ]; then
+        mapfile -t ALL_VERSIONS < "${TAG_CACHE_FILE}"
+    fi
+}
+
+
+# Known supported PHP versions (matching official php:<version>-cli-alpine tags)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -V|--version)
+            IFS=',' read -r -a version_list <<< "$2"
+            for version in "${version_list[@]}"; do
+                version="${version//[[:space:]]/}"
+                if [ -n "$version" ]; then
+                    if [ "$version" = "all" ]; then
+                        load_all_versions || exit 1
+
+                        for all_version in "${ALL_VERSIONS[@]}"; do
+                            add_version "$all_version" || exit 1
+                        done
+                    else
+                        add_version "$version" || exit 1
+                    fi
+                fi
+            done
+            shift 2
+            ;;
+        --coverage)
+            COVERAGE=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Usage: $0 [-V PHP_VERSION] [-- <phpunit args>]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ $# -gt 0 ]; then
+    PHPUNIT_ARGS=("$@")
+fi
+
+run_for_version() {
+    local php_version="$1"
+    shift
+    local phpunit_args=("$@")
+    local tmp_cfg=""
+    local base_tag=""
+    local run_status=0
+
+    # Resolve PHP version tag via docker; accept things like "" (latest)
+    # "8" (latest 8) or "8.5" or even "7.0.33".
+    if [ -z "$php_version" ]; then
+        base_tag="php:cli-alpine"
+    else
+        base_tag="php:${php_version}-cli-alpine"
+    fi
+    if ! docker image inspect "$base_tag" >/dev/null 2>&1; then
+        echo "Pulling docker image ${base_tag} as base PHP image..." >&2
+        if ! docker pull "$base_tag" >/dev/null 2>&1; then
+            echo "Error: unable to pull Docker image $base_tag. Please use an existing php:<version>-cli-alpine tag (e.g., 7.4, 8.3, 8, 8.5)." >&2
+            return 1
+        fi
+        echo "  ... pulled." >&2
+    else
+        [ -n "$DEBUG" ] && echo "Using cached docker image ${base_tag} as base PHP image" >&2
+    fi
+
+    # Discover the actual PHP version inside the base image
+    FULL_VERSION=$(docker run --rm "$base_tag" php -r 'echo PHP_VERSION;' 2>/dev/null || true)
+    if [ -z "$FULL_VERSION" ]; then
+        echo "Could not determine PHP version from $base_tag" >&2
+        return 1
+    fi
+    base_tag="php:${FULL_VERSION}-cli-alpine"
+
+    ## to avoid buildx querying registry
+    mkdir -p "${DIGEST_CACHE_DIR}"
+    if [ -f "${DIGEST_CACHE_DIR}/$base_tag" ]; then
+        base_image_by_digest="$(cat "${DIGEST_CACHE_DIR}/$base_tag")"
+    else
+        if ! inspect_base_image=$(docker buildx imagetools inspect "$base_tag"); then
+            echo "Could not inspect base image '$base_tag'" >&2
+            return 1
+        fi
+        base_image_by_digest=php@$(printf "%s" "$inspect_base_image" | grep 'Digest:' | head -n1 | awk '{print $2}')
+        echo "$base_image_by_digest" > "${DIGEST_CACHE_DIR}/$base_tag"
+    fi
+
+    major="${FULL_VERSION%%.*}"
+    minor_part="${FULL_VERSION#*.}"
+    minor="${minor_part%%.*}"
+    PHPUNIT_URL=""
+    COVERAGE_DRIVER="pcov"
+    XDEBUG_VERSION=""
+    PHPUNIT_MAJOR=12
+
+    if [ "$major" -eq 7 ] && [ "$minor" -eq 0 ]; then
+        # PHP 7.0 - no branch coverage (xdebug 2.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-6.5.14.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="2.6.1"
+        PHPUNIT_MAJOR=6
+    elif [ "$major" -eq 7 ] && [ "$minor" -eq 1 ]; then
+        # PHP 7.1 - no branch coverage (xdebug 2.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-7.5.20.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="2.6.1"
+        PHPUNIT_MAJOR=7
+    elif [ "$major" -eq 7 ] && [ "$minor" -eq 2 ]; then
+        # PHP 7.2 - no branch coverage (phpunit < 9.3)
+        #  cf: https://github.com/sebastianbergmann/phpunit/issues/4260
+        # phpunit 9.3 requires php 7.3+
+        #  cf: https://phpunit.de/announcements/phpunit-9.html
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-8.5.38.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.0.4"
+        PHPUNIT_MAJOR=8
+    elif [ "$major" -eq 7 ]; then
+        # PHP 7.3–7.4 - branch coverage supported (xdebug 3.1.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-9.6.19.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.1.6"
+        PHPUNIT_MAJOR=9
+    elif [ "$major" -eq 8 ] && [ "$minor" -eq 0 ]; then
+        # PHP 8.0 - branch coverage supported (xdebug 3.2.x)
+        # Note: xdebug 3.1.x has a path coverage segfault bug, fixed in 3.2.x
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-9.6.19.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
+        PHPUNIT_MAJOR=9
+    elif [ "$major" -eq 8 ] && [ "$minor" -eq 1 ]; then
+        # PHP 8.1 - branch coverage supported (xdebug 3.2.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-10.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
+        PHPUNIT_MAJOR=10
+    elif [ "$major" -eq 8 ] && [ "$minor" -eq 2 ]; then
+        # PHP 8.2 - branch coverage supported (xdebug 3.2.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-11.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.2.2"
+        PHPUNIT_MAJOR=11
+    elif [ "$major" -eq 8 ] && [ "$minor" -le 4 ]; then
+        # PHP 8.3-8.4 - branch coverage supported (xdebug 3.4.x)
+        # Note: xdebug 3.3.x has compilation errors with PHP 8.3.29+
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.4.0"
+        PHPUNIT_MAJOR=12
+    elif [ "$major" -eq 8 ]; then
+        # PHP 8.5+ - branch coverage supported (xdebug 3.5.x)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION="3.5.0"
+        PHPUNIT_MAJOR=12
+    else
+        # PHP 9+ (assume latest PHPUnit and xdebug)
+        PHPUNIT_URL="https://phar.phpunit.de/phpunit-12.phar"
+        COVERAGE_DRIVER="xdebug"
+        XDEBUG_VERSION=""
+        PHPUNIT_MAJOR=12
+    fi
+
+    IMAGE="comchain-phpunit:${FULL_VERSION}"
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+
+        DOCKERFILE_CONTENT=$(cat <<'EOF'
+ARG BASE_TAG=php:cli-alpine
+FROM ${BASE_TAG}
+
+ARG PHPUNIT_URL=https://phar.phpunit.de/phpunit-12.5.0.phar
+ARG COVERAGE_DRIVER=pcov
+ARG PCOV_VERSION=1.0.12
+ARG XDEBUG_VERSION=2.6.1
+
+RUN set -e; \
+    for i in 1 2 3; do apk update && break || sleep 2; done; \
+    apk add --no-cache curl git linux-headers $PHPIZE_DEPS; \
+    if [ "$COVERAGE_DRIVER" = "pcov" ]; then \
+        if pecl install pcov-${PCOV_VERSION}; then \
+            docker-php-ext-enable pcov; \
+            { echo "pcov.enabled=1"; echo "pcov.directory=/app"; echo "pcov.exclude=#/app/vendor#"; } > /usr/local/etc/php/conf.d/coverage.ini; \
+        else \
+            echo "pcov install failed, falling back to xdebug" >&2; \
+            if [ -n "${XDEBUG_VERSION}" ]; then pecl install xdebug-${XDEBUG_VERSION}; else pecl install xdebug; fi; \
+            docker-php-ext-enable xdebug; \
+            { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=no"; } > /usr/local/etc/php/conf.d/coverage.ini; \
+        fi; \
+    else \
+        if [ -n "${XDEBUG_VERSION}" ]; then pecl install xdebug-${XDEBUG_VERSION}; else pecl install xdebug; fi; \
+        docker-php-ext-enable xdebug; \
+        { echo "xdebug.mode=coverage"; echo "xdebug.start_with_request=no"; } > /usr/local/etc/php/conf.d/coverage.ini; \
+    fi; \
+    apk del $PHPIZE_DEPS; \
+    curl -Ls ${PHPUNIT_URL} -o /usr/local/bin/phpunit; \
+    chmod +x /usr/local/bin/phpunit
+
+WORKDIR /app
+CMD ["phpunit"]
+EOF
+                          )
+
+        echo "Building image ${IMAGE} (PHP ${php_version})..." >&2
+        if ! out=$(echo "${DOCKERFILE_CONTENT}" | docker build \
+                                                         --build-arg BASE_TAG="${base_image_by_digest}" \
+                                                         --build-arg PHPUNIT_URL="${PHPUNIT_URL}" \
+                                                         --build-arg COVERAGE_DRIVER="${COVERAGE_DRIVER}" \
+                                                         --build-arg PCOV_VERSION="${PCOV_VERSION}" \
+                                                         --build-arg XDEBUG_VERSION="${XDEBUG_VERSION}" \
+                                                         -t "${IMAGE}" -f - . ); then
+            echo "Error: unable to build Docker image ${IMAGE}" >&2
+            return 1
+        fi
+        echo "  Built image: ${out}" >&2
+    else
+        [ -n "$DEBUG" ] && echo "Using cached image ${IMAGE}" >&2
+    fi
+    # Generate phpunit configuration tailored to version (written to a temp file)
+    tmp_cfg="$(mktemp /tmp/phpunit.XXXXXX.xml)"
+
+    COVERAGE_XML=""
+    if $COVERAGE; then
+        if [ "${PHPUNIT_MAJOR}" -lt 9 ]; then
+            COVERAGE_XML="  <filter>
+    <whitelist processUncoveredFilesFromWhitelist=\"true\">
+      <file>/app/trnslist.php</file>
+    </whitelist>
+  </filter>"
+        elif [ "${PHPUNIT_MAJOR}" -lt 10 ]; then
+            COVERAGE_XML="  <coverage>
+    <include>
+      <file>/app/trnslist.php</file>
+    </include>
+  </coverage>"
+        else
+            COVERAGE_XML="  <source>
+    <include>
+      <file>/app/trnslist.php</file>
+    </include>
+  </source>"
+        fi
+    fi
+
+    cat > "$tmp_cfg" <<CFG
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit colors="true" bootstrap="/app/tests/bootstrap.php">
+  <testsuites>
+    <testsuite name="all">
+      <directory suffix="Test.php">/app/tests</directory>
+    </testsuite>
+  </testsuites>
+${COVERAGE_XML}
+</phpunit>
+CFG
+
+    [ -n "$DEBUG" ] && echo "Running phpunit in ${IMAGE}..." >&2
+    PHPUNIT_OPTS=()
+    if $COVERAGE; then
+        COVERAGE_DIR="$(pwd)/.coverage-html/${FULL_VERSION}"
+        rm -rf "${COVERAGE_DIR}"
+        mkdir -p "${COVERAGE_DIR}"
+        chmod 777 "${COVERAGE_DIR}"
+        PHPUNIT_OPTS+=(--coverage-html "${COVERAGE_DIR}" --coverage-text)
+        # Branch coverage requires Xdebug 3.0+ and PHPUnit 9.3+
+        if [ "${PHPUNIT_MAJOR}" -ge 9 ] && [ "${COVERAGE_DRIVER}" = "xdebug" ]; then
+            PHPUNIT_OPTS+=(--path-coverage)
+        fi
+        if [ "${PHPUNIT_MAJOR}" -ge 10 ]; then
+            PHPUNIT_OPTS+=(--coverage-filter /app/trnslist.php)
+        fi
+    fi
+
+    DOCKER_COVERAGE_MOUNT=()
+    if $COVERAGE; then
+        DOCKER_COVERAGE_MOUNT=(-v "${COVERAGE_DIR}:${COVERAGE_DIR}")
+    fi
+
+    # Memory limit for coverage (path coverage is memory intensive)
+    MEMORY_LIMIT="512M"
+    if $COVERAGE; then
+        MEMORY_LIMIT="1G"
+    fi
+
+    docker_run_opts=(
+        --rm
+        --user "${DOCKER_USER}"
+        -v "$PWD":/app
+        -v "$tmp_cfg":/tmp/phpunit.xml
+        "${DOCKER_COVERAGE_MOUNT[@]}" "${IMAGE}"
+    )
+
+    php_run_opts=(
+        -d memory_limit="${MEMORY_LIMIT}"
+    )
+    if [ "$major" -ge 8 ]; then
+        php_run_opts+=(-d error_reporting=8191)
+    fi
+
+    docker_run_cmd=(
+        docker run "${docker_run_opts[@]}"
+        php "${php_run_opts[@]}"
+        /usr/local/bin/phpunit -c /tmp/phpunit.xml "${PHPUNIT_OPTS[@]}" "${phpunit_args[@]}"
+    )
+
+    [ -n "$DEBUG" ] && echo "Running command: ${docker_run_cmd[*]}" >&2
+
+    "${docker_run_cmd[@]}"
+    run_status=$?
+
+    rm -f "$tmp_cfg"
+    if [ "$run_status" -ne 0 ]; then
+        echo "Tests ${RED}failed${RESET} for PHP ${FULL_VERSION}" >&2
+        return "$run_status"
+    fi
+    echo "Tests ${GREEN}passed${RESET} for PHP ${FULL_VERSION}" >&2
+
+    if $COVERAGE; then
+        LINK="file://${COVERAGE_DIR}/index.html"
+        COVERAGE_REPORTS+=("$FULL_VERSION|$LINK")
+    fi
+}
+
+print_coverage_reports() {
+    if $COVERAGE && [ "${#COVERAGE_REPORTS[@]}" -gt 0 ]; then
+        echo
+        echo "${WHITE}HTML Coverage reports${RESET}:"
+        for report in "${COVERAGE_REPORTS[@]}"; do
+            version="${report%%|*}"
+            link="${report#*|}"
+            printf ' - \e]8;;%s\e\\./coverage-html/%s\e]8;;\e\\\n' "$link" "$version"
+        done
+    fi
+}
+
+status=0
+if [ "${#VERSIONS[@]}" -eq 0 ]; then
+    if ! run_for_version "" "${PHPUNIT_ARGS[@]}"; then
+        status=$?
+    fi
+else
+    for version in "${VERSIONS[@]}"; do
+        if ! run_for_version "$version" "${PHPUNIT_ARGS[@]}"; then
+            status=$?
+            break
+        fi
+    done
+fi
+
+print_coverage_reports
+exit "$status"
