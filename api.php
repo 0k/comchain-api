@@ -43,6 +43,7 @@ function blockNumber($gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return $block;
 }
@@ -56,6 +57,7 @@ function getEstimatedGas($txobj, $gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -93,6 +95,7 @@ function getTransaction($hash, $gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -109,6 +112,7 @@ function getEthCall($txobj, $gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -123,6 +127,7 @@ function getEthCallAt($txobj, $blockNb, $gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -147,6 +152,7 @@ function getTransactionData($addr, $gethRPC){
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -166,6 +172,7 @@ function getEthBalance($addr, $gethRPC)
     catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     return json_encode($data);
 }
@@ -669,6 +676,7 @@ function sendRawTransaction($rawtx,$gethRPC){
     } catch (exception $e) {
         $data['error'] = true;
         $data['msg'] = $e->getMessage();
+        error_log($e->getMessage(),0);
     }
     
     /* $data['dbg']= $dbg; */
@@ -733,6 +741,7 @@ function getBatchEthCallAt($batch, $gethRPC)
         );
         return json_encode(['error' => false, 'data' => $out]);
     } catch (Exception $e) {
+        error_log($e->getMessage(),0);
         return json_encode(['error' => true, 'msg' => $e->getMessage()]);
     }
 }
