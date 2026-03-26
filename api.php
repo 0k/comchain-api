@@ -7,7 +7,8 @@ require_once 'libs/jsonRPCClient.php';
 $gethRPC = new jsonRPCClient('http://127.0.0.1:8545');
 if(isset($_REQUEST['balance'])){
     header('Content-Type: application/json');
-    echo getEthBalance($_REQUEST['balance'],$gethRPC);
+    $blockNb = isset($_REQUEST['blockNb']) ? $_REQUEST['blockNb'] : "pending";
+    echo getEthBalance($_REQUEST['balance'],$gethRPC,$blockNb);
 } else if(isset($_REQUEST['rawtx'])){
     header('Content-Type: application/json');
     echo sendRawTransaction($_REQUEST['rawtx'],$gethRPC);
@@ -156,13 +157,13 @@ function getTransactionData($addr, $gethRPC){
     }
     return json_encode($data);
 }
-function getEthBalance($addr, $gethRPC)
+function getEthBalance($addr, $gethRPC, $blockNb = "pending")
 {
     $data = getDefaultResponse();
     try {
         $addr = formatAddress($addr);
         $balancehex = getRPCResponse($gethRPC->eth_getBalance($addr,
-            "pending"));
+            $blockNb));
         $balance=bchexdec($balancehex);
         $tarr['address'] = $addr;
         $tarr['balance'] = $balance;
