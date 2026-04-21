@@ -733,9 +733,6 @@ function getBatchEthCallAt($batch, $gethRPC)
                     }
                     return ['error' => ['msg' => "unknown error"], 'data' => $r['error']];
                 }
-                if ($r['result'] == "0x") {
-                    return ['error' => ['msg' => "Invalid Geth Call"], 'data' => "InvalidCall"];
-                }
                 return ['data' => $r['result']];
             },
             $responses
