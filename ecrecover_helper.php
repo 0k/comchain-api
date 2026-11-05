@@ -7,6 +7,7 @@ require_once './Keccak.php';
 use kornrunner\Keccak;
 
 require_once './Buffer.php';
+require_once __DIR__ . '/includes/rawtx.inc';
 
 function encodeLength(int $l, int $offset)
     {
@@ -23,20 +24,14 @@ function encodeLength(int $l, int $offset)
 
 
 function TransactionEcRecover($rawTx) {
-    // get the signature, last 134 chars
-    $len = strlen($rawTx);
-    $len_data = $len - 134;
-    $signature = substr($rawTx, $len_data);
-    $v = substr($signature,0,2);
-    $r = substr($signature,4,64);
-    $s = substr($signature,70,64);
-    $signed = '0x'.$r.$s.$v;
-    
-    // get the rlp encoded data (change the length)
-    $subs = substr($rawTx, 6, $len_data-6); // 2 for the 0x + 4 for the 2 first bytes giving the length with the signature
-    $data_len = strlen($subs)/2;
-    // add the new length
-    $data = encodeLength($data_len,192).$subs;
+    $tx = decodeRawTransaction($rawTx);
+    // RLP drops leading zero bytes: restore r and s to 32 bytes, v to 1.
+    $signed = '0x'.str_pad($tx['r'], 64, '0', STR_PAD_LEFT)
+                  .str_pad($tx['s'], 64, '0', STR_PAD_LEFT)
+                  .str_pad($tx['v'], 2, '0', STR_PAD_LEFT);
+
+    // the signed hash covers the RLP list of the unsigned fields
+    $data = encodeLength(strlen($tx['unsigned'])/2, 192).$tx['unsigned'];
     $hash = keccak256WithPrefix(hex2bin($data));
     return ecRecoverPublic($hash, $signed);
 }

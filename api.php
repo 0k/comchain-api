@@ -3,6 +3,7 @@ header('Access-Control-Allow-Origin: *');
 include './checkAdmin.php';
 include './Webhook.php';
 require_once 'libs/jsonRPCClient.php';
+require_once __DIR__ . '/includes/rawtx.inc';
 
 $gethRPC = new jsonRPCClient('http://127.0.0.1:8545');
 if(isset($_REQUEST['balance'])){
@@ -407,14 +408,12 @@ function sendRawTransaction($rawtx,$gethRPC){
    
     try {
     
-        // length input 2 vs 3 x64
-        $is_f2 = false;
-        $is_f3 = false;
-        if (strlen($rawtx)>316 && substr($rawtx,-274,4) == 'b844'){
-            $is_f2 = true;
-        } else if (strlen($rawtx)>380  && substr($rawtx,-338,4) == 'b864'){
-            $is_f3 = true;
-        }
+        // number of call arguments: 2 vs 3 x64 (decoded, as r and s
+        // are not always 32 bytes long: no fixed offsets in $rawtx)
+        $call = decodeContractCall($rawtx);
+        $nb_args = $call === null ? 0 : count($call['args']);
+        $is_f2 = $nb_args == 2;
+        $is_f3 = $nb_args == 3;
         
         
         $need_pending = false;
@@ -424,24 +423,23 @@ function sendRawTransaction($rawtx,$gethRPC){
         $to_add = '';
         $dbg ='';
         if ($is_f3){
-            $tr_info = substr($rawtx,-380,246);
             //get the type of transfert
-            $funct_address = strtolower(substr($tr_info,46,8));
+            $funct_address = $call['selector'];
             // get the sender
             $sender = TransactionEcRecover($rawtx)[0];
             // get the contract for the balances
-            $contract = getContract1(substr($tr_info,0,40));
-            $contract2 = '0x'.substr($tr_info,0,40);
+            $contract = getContract1(substr($call['contract'],2));
+            $contract2 = $call['contract'];
             $currency = getCurrency($contract);
             if ($funct_address==$transfert_NA_functions[2] || $funct_address==$transfert_CM_functions[2]) {
                 // Transfert On Behalf 
             
                 // get the account debited
-                $from_add = '0x'.substr($tr_info,78,40);
+                $from_add = '0x'.substr($call['args'][0],24,40);
                 // get the dest.
-                $to_add = '0x'.substr($tr_info,142,40);
+                $to_add = '0x'.substr($call['args'][1],24,40);
                 // get the amount
-                $amount = hexdec(substr($tr_info,-64));
+                $amount = hexdec($call['args'][2]);
                 
                 if (!checkPreventTransactionRule($from_add, $to_add, $contract)) {
                      $data["data"] = "TransactionBetweenForbidenAccountTypes";
@@ -500,19 +498,18 @@ function sendRawTransaction($rawtx,$gethRPC){
                 }
             }
         } else if ($is_f2){
-            $tr_info = substr($rawtx,-316,182);
             //get the type of transfert
-            $funct_address = strtolower(substr($tr_info,46,8));
+            $funct_address = $call['selector'];
             // get the sender
             $sender = TransactionEcRecover($rawtx)[0];
             // get the contract for the balances
-            $contract = getContract1(substr($tr_info,0,40));
-            $contract2 = '0x'.substr($tr_info,0,40);
+            $contract = getContract1(substr($call['contract'],2));
+            $contract2 = $call['contract'];
             $currency = getCurrency($contract);
             // get the dest
-            $dest = '0x'.substr($tr_info,78,40);
+            $dest = '0x'.substr($call['args'][0],24,40);
             // get the amount
-            $amount = hexdec(substr($tr_info,-64));
+            $amount = hexdec($call['args'][1]);
             
             if (in_my_array($funct_address, $transfert_functs)) {
 
