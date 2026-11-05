@@ -281,10 +281,7 @@ run_for_version() {
         PHPUNIT_MAJOR=12
     fi
 
-    IMAGE="comchain-phpunit:${FULL_VERSION}"
-    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-
-        DOCKERFILE_CONTENT=$(cat <<'EOF'
+    DOCKERFILE_CONTENT=$(cat <<'EOF'
 ARG BASE_TAG=php:cli-alpine
 FROM ${BASE_TAG}
 
@@ -295,7 +292,8 @@ ARG XDEBUG_VERSION=2.6.1
 
 RUN set -e; \
     for i in 1 2 3; do apk update && break || sleep 2; done; \
-    apk add --no-cache curl git linux-headers $PHPIZE_DEPS; \
+    apk add --no-cache curl git linux-headers gmp-dev $PHPIZE_DEPS; \
+    docker-php-ext-install gmp; \
     if [ "$COVERAGE_DRIVER" = "pcov" ]; then \
         if pecl install pcov-${PCOV_VERSION}; then \
             docker-php-ext-enable pcov; \
@@ -318,8 +316,14 @@ RUN set -e; \
 WORKDIR /app
 CMD ["phpunit"]
 EOF
-                          )
+                      )
 
+    ## The tag carries a digest of the Dockerfile so that any change to it
+    ## (e.g. a new PHP extension) builds a fresh image instead of reusing
+    ## a cached one that lacks it.
+    DOCKERFILE_DIGEST=$(printf '%s' "${DOCKERFILE_CONTENT}" | cksum | cut -d' ' -f1)
+    IMAGE="comchain-phpunit:${FULL_VERSION}-${DOCKERFILE_DIGEST}"
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         echo "Building image ${IMAGE} (PHP ${php_version})..." >&2
         if ! out=$(echo "${DOCKERFILE_CONTENT}" | docker build \
                                                          --build-arg BASE_TAG="${base_image_by_digest}" \
